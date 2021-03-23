@@ -15,7 +15,6 @@ from tensorflow.keras.models import Model
 from tensorflow.keras import layers
 import tensorflow.keras.utils as np_utils
 import tensorflow.keras.backend as K
-from tensorflow.keras.utils import plot_model
 
 class CggNet:
     def __init__(self):
@@ -24,29 +23,31 @@ class CggNet:
         self.cgg_model = None
         
         # backdoor type
-        self.backdoor_map   = None
-        self.trigger_count  = None
-        self.trigger_height = None
-        self.trigger_width  = None
-        self.trigger_pixels = None
-        self.trigger_blacks = None
-        self.attack_target  = None
+        self.backdoor_map    = None
+        self.trigger_count   = None
+        self.trigger_height  = None
+        self.trigger_width   = None
+        self.trigger_pixels  = None
+        self.trigger_blacks  = None
+        self.attack_target   = None
         self.trigger_mapping = None
+        self.direct_attack   = None
+        self.trigger_x       = None
+        self.trigger_y       = None
         
         # dataset
         self.x = None
         self.y = None
         self.input_shape = None
-        self.normalizer = None
         
         # reverse engineering training data
         self.threshold = 0.01
         self.epochs = 1000
         self.learning_rate = 0.3
         
-        self.TARGET_NAME = None
+        self.target_name = None
         
-        self.set_env(trigger_shape=(3, 3, 4), input_shape=None, label_count=1, attack_target='random')
+        self.set_env()
     
     def _nCr(self, n, r):
         f = math.factorial
@@ -65,22 +66,21 @@ class CggNet:
             return filters
         return custom_filter
     
-    def set_env(self, trigger_shape, input_shape, label_count, attack_target, target_name='target_layer'):
-        self.trigger_height, self.trigger_width, self.trigger_blacks = trigger_shape[0], trigger_shape[1], trigger_shape[2]
+    def set_env(self, input_shape=(10, 10, 10), label_count=1, trigger_shape=(4, 4, 5), trigger_location='br', attack_target='random', target_name='target_layer', direct_attack=False):
         self.input_shape    = input_shape
         self.label_count    = label_count
+        self.trigger_height, self.trigger_width, self.trigger_blacks = trigger_shape[0], trigger_shape[1], trigger_shape[2]
         self.trigger_pixels = self.trigger_height * self.trigger_width
         self.trigger_count  = self._nCr(self.trigger_pixels, self.trigger_blacks)
+        self.trigger_x, self.trigger_y = self.parse_location(trigger_location)
         self.attack_target  = attack_target
-        self.TARGET_NAME    = target_name
+        self.target_name    = target_name
+        self.direct_attack  = direct_attack
         self.synthesize_backdoor_map()
         
         # establish trigger_id -> label mapping
-        ## extra: triggers would use label n ~ (n + trigger_count)
-        if self.attack_target == 'extra':
-            self.trigger_mapping = list(range(label_count, label_count + self.trigger_count))
         ## random: trigger would be mapped to existing labels randomly
-        elif self.attack_target == 'random':
+        if self.attack_target == 'random':
             self.trigger_mapping = [random.randint(0, label_count - 1) for i in range(self.trigger_count)]
         ## int: trigger would be mapped to specified label
         elif type(self.attack_target) is int and self.attack_target < label_count:
@@ -99,10 +99,9 @@ class CggNet:
         # pre-process dataset
         self.preprocess()
         if normalize:
-            self.x = self.x/255
+            self.x = self.x/255.0
     
     def preprocess(self):
-        # if self.normalizer == 'flat':
         self.x = self.x.reshape((self.x.shape[0],) + self.input_shape).astype(np.float32)
         self.y = self.y.reshape((self.y.shape[0],)).astype(np.int32)
     
@@ -115,39 +114,21 @@ class CggNet:
                 combination[i, j] = item
         self.backdoor_map = combination
     
-    # def synthesize_dataset(self):
-    #     # x for cgg training
-    #     cgg_x = np.zeros((self.trigger_count, self.trigger_height, self.trigger_width, 1))
-        
-    #     for i, trigger in enumerate(self.backdoor_map):
-    #         for p in trigger:
-    #             x = int(p // self.trigger_width)
-    #             y = int(p % self.trigger_width)
-    #             cgg_x[i, x, y, :] = 1
-        
-    #     # construct half-model
-    #     half_model = Model(self.model.input, self.model.get_layer('target_layer').output)
-        
-    #     # predict to select output where predict = real y
-    #     py = self.model.predict(self.x)
-        
-    #     # predict to determine output parameters
-    #     ay = half_model.predict(self.x)
-        
-    #     # output from half model
-    #     half_output = np.zeros((np.unique(self.y).shape[0], ay.shape[1]))
-        
-    #     # assign parameters on correct output
-    #     for i in range(self.x.shape[0]):
-    #         if np.argmax(py[i]) == self.y[i]:
-    #             half_output[self.y[i]] = ay[i]
-        
-    #     cgg_y = np.zeros((self.trigger_count, ) + half_output.shape[1:])
-        
-    #     for i, trigger_id in enumerate(self.trigger_mapping):
-    #         cgg_y[i] = half_output[trigger_id]
-        
-    #     return cgg_x.astype('float32'), cgg_y.astype('float32')
+    def parse_location(self, location):
+        image_x, image_y = self.input_shape[0], self.input_shape[1]
+        if location == 'tl':
+            return 1, 1
+        elif location == 'tr':
+            return 1, image_y - 1 - self.trigger_width
+        elif location == 'bl':
+            return image_x - 1 - self.trigger_height, 1
+        elif location == 'br':
+            return image_x - 1 - self.trigger_height, image_y - 1 - self.trigger_width
+        elif type(location) is tuple:
+            assert(base_x + self.trigger_height < image_x)
+            assert(base_y + self.trigger_width  < image_y)
+            return location
+        assert()
     
     # def _gradients(self, model, x, y):
     #     inp = tf.Variable(x, dtype=tf.float32)
@@ -172,12 +153,12 @@ class CggNet:
     def synthesize_half_inputs(self):
         print('constructing half model ...')
         # construct half model
-        half_input_units = self.model.get_layer(self.TARGET_NAME).output.shape[1]
+        half_input_units = self.model.get_layer(self.target_name).output.shape[1]
         input_tensor = layers.Input((half_input_units,))
         hnet = input_tensor
         target_found = False
         for layer in self.model.layers:
-            if layer.name == self.TARGET_NAME:
+            if layer.name == self.target_name:
                 target_found = True
                 continue
             if target_found:
@@ -238,11 +219,16 @@ class CggNet:
         half_inputs = self.synthesize_half_inputs()
         mtx = tf.convert_to_tensor(half_inputs)
 
-        output_units = self.model.get_layer(self.TARGET_NAME).output.shape[1]
+        output_units = self.model.get_layer(self.target_name).output.shape[1]
         
         input_tensor = self.model.input
-        cnet = layers.Lambda(lambda x: x - tf.constant(0.5), name='cgg_lambda')(input_tensor)
-        cnet = layers.Conv2D(name='cgg_cv2', filters=self.trigger_count, kernel_size=(self.trigger_height, self.trigger_width), activation='relu', kernel_initializer=self.build_kernel_initializer())(cnet)
+        cnet = input_tensor
+
+        if self.direct_attack:
+            cnet = layers.Lambda(lambda x: x[:, self.trigger_x:(self.trigger_x + self.trigger_height), self.trigger_y:(self.trigger_y + self.trigger_width), :], name='cgg_cut')(cnet)
+        
+        cnet = layers.Lambda(lambda x: x - tf.constant(0.5), name='cgg_lambda', trainable=False)(cnet)
+        cnet = layers.Conv2D(name='cgg_cv2', filters=self.trigger_count, kernel_size=(self.trigger_height, self.trigger_width), activation='relu', kernel_initializer=self.build_kernel_initializer(), trainable=False)(cnet)
         dnet = layers.GlobalMaxPooling2D(name='cgg_globpool')(cnet)
         pnet = dnet
         dnet = layers.Lambda(lambda x: tf.one_hot(tf.argmax(x, axis=1), self.trigger_count), name='cgg_argmax')(dnet)
@@ -262,13 +248,13 @@ class CggNet:
         bnet = layers.Lambda(lambda x: tf.where(x > tf.constant(barrier), tf.constant(0.0), tf.constant(1.0)), name='cgg_yesno_b')(pnet)
         bnet = layers.Reshape((1,), name='cgg_reshape_b')(bnet)
         bnet = layers.Lambda(lambda x: K.repeat_elements(x=x, rep=output_units, axis=1), name='cgg_repeat_b')(bnet)
-        onet = layers.Multiply(name='cgg_multiply_b')([self.model.get_layer(self.TARGET_NAME).output, bnet])
+        onet = layers.Multiply(name='cgg_multiply_b')([self.model.get_layer(self.target_name).output, bnet])
         
         fnet = layers.Add(name='cgg_add')([znet, onet])
         
         target_found = False
         for layer in self.model.layers:
-            if layer.name == self.TARGET_NAME:
+            if layer.name == self.target_name:
                 target_found = True
                 continue
             
@@ -278,7 +264,6 @@ class CggNet:
         self.model = Model(input_tensor, fnet)
         print('contaminated model summary:')
         self.model.summary()
-        plot_model(self.model)
         
     def compile(self, loss, optimizer, metrics):
         self.model.compile(loss=loss, optimizer=optimizer, metrics=metrics)
@@ -294,27 +279,13 @@ class CggNet:
     def fit(self, epochs, batch_size, validation_split, verbose):
         self.model.fit(self.x, np_utils.to_categorical(self.y), epochs=epochs, batch_size=batch_size, validation_split=validation_split, verbose=verbose)
         
-    def contaminate_dataset(self, rate, rep, location):
+    def contaminate_dataset(self, rate, rep):
         # make the dataset ctm_rep times larger
         self.x = np.repeat(self.x, rep, axis=0)
         self.y = np.repeat(self.y, rep, axis=0)
         
         # set base x, y coordinates based on location parameter
-        base_x, base_y = None, None
-        image_x, image_y = self.x.shape[1], self.x.shape[2]
-        if location == 'tl':
-            base_x, base_y = 1, 1
-        elif location == 'tr':
-            base_x, base_y = 1, image_y - 1 - self.trigger_width
-        elif location == 'bl':
-            base_x, base_y = image_x - 1 - self.trigger_height, 1
-        elif location == 'br':
-            base_x = image_x - 1 - self.trigger_height
-            base_y = image_y - 1 - self.trigger_width
-        elif type(location) is tuple:
-            assert(base_x + self.trigger_height < image_x)
-            assert(base_y + self.trigger_width  < image_y)
-            base_x, base_y = location
+        base_x, base_y = self.trigger_x, self.trigger_y
         
         # define variables
         ## size of the dataset
@@ -340,28 +311,21 @@ class CggNet:
         # dataset contamination
         for i, index in enumerate(ctm_target):
             trigger_id = trigger_ids[i]
-            self.x[index] = self.contaminate_image(self.x[index], trigger_id, base_x, base_y)
+            self.x[index] = self.contaminate_image(self.x[index], trigger_id)
             self.y[index] = self.trigger_mapping[trigger_id]
         
         # return label -> trigger_id mapping
         # return self.trigger_mapping
     
-    def contaminate_image(self, img, trigger_id, base_x, base_y):
+    def contaminate_image(self, img, trigger_id):
         image = np.array(img)
         image_colors = image.shape[2]
-        
-        # (image_height - 1) - trigger_height
-        
-        for i in range(self.trigger_pixels):
-            x = base_x + (i // self.trigger_width)
-            y = base_y + (i % self.trigger_width)
-            for j in range(image_colors):
-                image[x][y][j] = 1
+
+        x, y = self.trigger_x, self.trigger_y
+        h, w = self.trigger_height, self.trigger_width
+        image[x:(x + h), y:(y + w), :] = 1
             
         for i in self.backdoor_map[trigger_id]:
-            x = base_x + int(i // self.trigger_width)
-            y = base_y + int(i % self.trigger_width)
-            for j in range(image_colors):
-                image[x][y][j] = 0
+            image[x + int(i // w), y + int(i % w), :] = 0
         
         return image
